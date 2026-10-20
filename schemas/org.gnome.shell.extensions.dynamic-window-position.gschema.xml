@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.dynamic-window-position"
+          path="/org/gnome/shell/extensions/dynamic-window-position/">
+    <key name="restore-session" type="b">
+      <default>true</default>
+      <summary>Restore last session at login</summary>
+      <description>Reopen apps that were open in the last session and put their windows back where they were.</description>
+    </key>
+    <key name="ignored-apps" type="as">
+      <default>[]</default>
+      <summary>Apps not reopened at login</summary>
+      <description>Desktop app IDs (e.g. slack_slack.desktop) that are never launched by session restore. Their windows are still placed if they open.</description>
+    </key>
+    <key name="launch-delay" type="i">
+      <range min="0" max="120"/>
+      <default>10</default>
+      <summary>Seconds after login before reopening apps</summary>
+      <description>Gives autostart apps time to open first, so they aren't launched twice.</description>
+    </key>
+    <key name="docked-size-percent" type="i">
+      <range min="20" max="100"/>
+      <default>60</default>
+      <summary>Size of windows placed on the external monitor for the first time</summary>
+      <description>Percentage of the external monitor's width and height.</description>
+    </key>
+    <key name="debug-logging" type="b">
+      <default>false</default>
+      <summary>Debug logging</summary>
+      <description>Log restore decisions to the GNOME Shell journal.</description>
+    </key>
+  </schema>
+</schemalist>

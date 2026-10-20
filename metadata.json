@@ -1,0 +1,15 @@
+{
+    "name": "Dynamic Window Position",
+    "description": "Keeps a separate window layout for each monitor setup (docked with an external monitor, laptop only) and switches between them when the monitor is connected or disconnected. At login, reopens the apps from the last session and puts their windows back where they were.",
+    "uuid": "dynamic-window-position@wranvaud",
+    "shell-version": [
+        "50"
+    ],
+    "version": 1,
+    "url": "https://github.com/wranvaud/dynamic-window-position",
+    "settings-schema": "org.gnome.shell.extensions.dynamic-window-position",
+    "session-modes": [
+        "user",
+        "unlock-dialog"
+    ]
+}
