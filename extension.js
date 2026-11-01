@@ -290,15 +290,7 @@ export default class DynamicWindowPositionExtension extends Extension {
 
         if (this._inPlacementWindow()) {
             this._watchTitle(win);
-            if (this._matchWindow(win, false))
-                return;
-        }
-
-        if (this._settings.get_string('new-window-placement') === 'maximize-laptop' &&
-            this._monitorInfo().laptopOnly && !this._restoring &&
-            win.can_maximize() && !win.is_maximized()) {
-            debug(`maximizing new window "${win.get_title()}"`);
-            win.maximize();
+            this._matchWindow(win, false);
         }
     }
 
@@ -626,14 +618,15 @@ export default class DynamicWindowPositionExtension extends Extension {
             const entry = this._layouts.get(this._currentKey)?.windows.get(uid);
             if (entry && this._applyEntry(win, entry, info))
                 return;
-            // Only saved in another setup: keep its workspace from there.
-            let workspace = global.workspace_manager.get_active_workspace_index();
+            // Only saved in another setup: there was no monitor change, so
+            // leave it where GNOME put it, on its workspace from there.
             for (const layout of this._layouts.values()) {
                 const other = layout.windows.get(uid);
-                if (other && !other.onAllWorkspaces && other.workspace >= 0)
-                    workspace = other.workspace;
+                if (other && !other.onAllWorkspaces && other.workspace >= 0) {
+                    this._moveToWorkspace(win, other.workspace);
+                    break;
+                }
             }
-            this._placeNew(win, workspace, info);
         };
 
         for (const ms of MATCH_PASSES_MS) {
@@ -747,8 +740,8 @@ export default class DynamicWindowPositionExtension extends Extension {
             if (entry && this._applyEntry(win, entry, info))
                 continue;
 
-            // Not seen in this setup before: keep the workspace it had in
-            // the setup we're coming from.
+            // Not seen in this setup before: place it by rule, keeping the
+            // workspace it had in the setup we're coming from.
             const prevEntry = uid && prevLayout?.windows.get(uid);
             let workspace = global.workspace_manager.get_active_workspace_index();
             if (prevEntry && !prevEntry.onAllWorkspaces && prevEntry.workspace >= 0)
@@ -756,7 +749,10 @@ export default class DynamicWindowPositionExtension extends Extension {
             else if (prevLayout)
                 workspace = prevLayout.activeWorkspace;
 
-            this._placeNew(win, workspace, info);
+            if (info.laptopOnly)
+                this._placeLaptop(win, workspace);
+            else
+                this._placeExternal(win, workspace);
         }
     }
 
@@ -791,18 +787,6 @@ export default class DynamicWindowPositionExtension extends Extension {
         if (!entry.onAllWorkspaces && entry.workspace >= 0)
             this._moveToWorkspace(win, entry.workspace);
         return true;
-    }
-
-    // A window with no saved position in the current setup.
-    _placeNew(win, workspace, info) {
-        if (this._settings.get_string('new-window-placement') !== 'maximize-laptop') {
-            debug(`keep "${win.get_title()}" where GNOME put it, ws=${workspace}`);
-            this._moveToWorkspace(win, workspace);
-        } else if (info.laptopOnly) {
-            this._placeLaptop(win, workspace);
-        } else {
-            this._placeExternal(win, workspace);
-        }
     }
 
     _placeExternal(win, workspace) {

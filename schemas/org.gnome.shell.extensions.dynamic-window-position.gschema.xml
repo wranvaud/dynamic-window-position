@@ -18,20 +18,11 @@
       <summary>Seconds after login before reopening apps</summary>
       <description>Gives autostart apps time to open first, so they aren't launched twice.</description>
     </key>
-    <key name="new-window-placement" type="s">
-      <choices>
-        <choice value="gnome"/>
-        <choice value="maximize-laptop"/>
-      </choices>
-      <default>'gnome'</default>
-      <summary>Placement of windows without a saved position</summary>
-      <description>"gnome" leaves new windows and windows not yet seen in a monitor setup where GNOME puts them (only their workspace is kept). "maximize-laptop" maximizes them on the laptop screen and centers them on an external monitor at docked-size-percent.</description>
-    </key>
     <key name="docked-size-percent" type="i">
       <range min="20" max="100"/>
       <default>60</default>
-      <summary>Size of windows placed on an external monitor for the first time</summary>
-      <description>Percentage of the monitor's width and height. Only used when new-window-placement is "maximize-laptop".</description>
+      <summary>Size of windows moved to an external monitor for the first time</summary>
+      <description>Percentage of the primary monitor's width and height, for windows with no saved position in a setup when monitors are connected.</description>
     </key>
     <key name="settle-delay" type="i">
       <range min="0" max="30"/>

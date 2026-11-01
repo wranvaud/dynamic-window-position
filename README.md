@@ -72,10 +72,10 @@ extension:
   wait can also be set by hand in the settings.
 
 Windows with no saved position in the new setup keep their workspace and are
-left where GNOME puts them. Optionally, they can instead be maximized on the
-laptop screen and centered on an external monitor (60 % of the screen by
-default); new windows opened on the laptop screen alone are then maximized
-too.
+placed by rule: maximized when moving to the laptop screen alone, centered on
+the primary monitor at 60 % of the screen (configurable) when external
+monitors are connected. This only happens when monitors are connected or
+disconnected; windows you open are always placed by GNOME as usual.
 
 ### Session restore
 
@@ -107,8 +107,7 @@ Open them from the Extensions app, or with
 - Turn session restore on or off.
 - Delay before reopening apps at login.
 - Apps not reopened at login (their windows are still put back if they open).
-- Placement of windows with no saved position: left to GNOME, or maximized on
-  the laptop and centered on an external monitor (with its size).
+- Size of windows moved to an external monitor with no saved position there.
 - Monitor settle time: measured automatically, or set by hand.
 - Debug logging.
 

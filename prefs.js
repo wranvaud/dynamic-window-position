@@ -94,37 +94,14 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
         // Layout
         const layoutGroup = new Adw.PreferencesGroup({
             title: 'Monitor Layouts',
-            description: 'Each combination of monitors keeps its own layout. These options apply to windows that have no saved position yet in the current setup.',
+            description: 'Each combination of monitors keeps its own layout. When a window has no saved position in the new setup, it is maximized on the laptop screen alone, or centered on the primary external monitor.',
         });
         page.add(layoutGroup);
 
-        const placements = ['gnome', 'maximize-laptop'];
-        const placementRow = new Adw.ComboRow({
-            title: 'Windows without a saved position',
-            model: Gtk.StringList.new([
-                'Let GNOME place them',
-                'Maximize on laptop, center on external monitor',
-            ]),
-        });
-        const syncPlacement = () => {
-            placementRow.selected = Math.max(0, placements.indexOf(settings.get_string('new-window-placement')));
-        };
-        syncPlacement();
-        settings.connect('changed::new-window-placement', syncPlacement);
-        placementRow.connect('notify::selected', () =>
-            settings.set_string('new-window-placement', placements[placementRow.selected]));
-        layoutGroup.add(placementRow);
-
-        const sizeRow = this._intSpinRow(settings, 'docked-size-percent', 20, 100, {
-            title: 'Size on the external monitor',
-            subtitle: 'Percent of the screen',
-        });
-        const syncSize = () => {
-            sizeRow.sensitive = settings.get_string('new-window-placement') === 'maximize-laptop';
-        };
-        syncSize();
-        settings.connect('changed::new-window-placement', syncSize);
-        layoutGroup.add(sizeRow);
+        layoutGroup.add(this._intSpinRow(settings, 'docked-size-percent', 20, 100, {
+            title: 'Size of windows moved to an external monitor',
+            subtitle: 'Percent of the screen, when they have no saved position there',
+        }));
 
         this._addSettleRows(layoutGroup, settings);
 
