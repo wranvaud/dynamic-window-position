@@ -42,6 +42,8 @@ const TITLE_WATCH_MS = 8000;
 // When a matched window is placed; later passes catch slow clients.
 const MATCH_PASSES_MS = [0, 1000, 4000];
 const LAUNCH_STAGGER_MS = 500;
+// Size of a window moved to an external monitor with no saved position there.
+const EXTERNAL_SIZE_RATIO = 0.6;
 // Let the session settle before showing compatibility warnings.
 const COMPAT_NOTIFY_DELAY_MS = 5000;
 
@@ -794,15 +796,14 @@ export default class DynamicWindowPositionExtension extends Extension {
         const primary = global.display.get_primary_monitor();
         const area = global.workspace_manager.get_active_workspace()
             .get_work_area_for_monitor(primary);
-        const ratio = this._settings.get_int('docked-size-percent') / 100;
 
         if (win.is_maximized())
             win.unmaximize();
 
         let {width, height} = win.get_frame_rect();
         if (win.allows_resize()) {
-            width = Math.round(area.width * ratio);
-            height = Math.round(area.height * ratio);
+            width = Math.round(area.width * EXTERNAL_SIZE_RATIO);
+            height = Math.round(area.height * EXTERNAL_SIZE_RATIO);
         }
         const x = area.x + Math.round((area.width - width) / 2);
         const y = area.y + Math.round((area.height - height) / 2);

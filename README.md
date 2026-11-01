@@ -73,7 +73,7 @@ extension:
 
 Windows with no saved position in the new setup keep their workspace and are
 placed by rule: maximized when moving to the laptop screen alone, centered on
-the primary monitor at 60 % of the screen (configurable) when external
+the primary monitor at 60 % of the screen when external
 monitors are connected. This only happens when monitors are connected or
 disconnected; windows you open are always placed by GNOME as usual.
 
@@ -107,7 +107,6 @@ Open them from the Extensions app, or with
 - Turn session restore on or off.
 - Delay before reopening apps at login.
 - Apps not reopened at login (their windows are still put back if they open).
-- Size of windows moved to an external monitor with no saved position there.
 - Monitor settle time: measured automatically, or set by hand.
 - Debug logging.
 

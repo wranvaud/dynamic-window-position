@@ -18,12 +18,6 @@
       <summary>Seconds after login before reopening apps</summary>
       <description>Gives autostart apps time to open first, so they aren't launched twice.</description>
     </key>
-    <key name="docked-size-percent" type="i">
-      <range min="20" max="100"/>
-      <default>60</default>
-      <summary>Size of windows moved to an external monitor for the first time</summary>
-      <description>Percentage of the primary monitor's width and height, for windows with no saved position in a setup when monitors are connected.</description>
-    </key>
     <key name="settle-delay" type="i">
       <range min="0" max="30"/>
       <default>0</default>

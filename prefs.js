@@ -94,14 +94,9 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
         // Layout
         const layoutGroup = new Adw.PreferencesGroup({
             title: 'Monitor Layouts',
-            description: 'Each combination of monitors keeps its own layout. When a window has no saved position in the new setup, it is maximized on the laptop screen alone, or centered on the primary external monitor.',
+            description: 'Each combination of monitors keeps its own layout. When a window has no saved position in the new setup, it is maximized on the laptop screen alone, or centered on the primary external monitor at 60 % of its size.',
         });
         page.add(layoutGroup);
-
-        layoutGroup.add(this._intSpinRow(settings, 'docked-size-percent', 20, 100, {
-            title: 'Size of windows moved to an external monitor',
-            subtitle: 'Percent of the screen, when they have no saved position there',
-        }));
 
         this._addSettleRows(layoutGroup, settings);
 
