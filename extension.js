@@ -5,6 +5,8 @@ import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+import {compatibilityIssues} from './compat.js';
+
 // Quiet period before a layout snapshot is taken. Mutter's own hotplug
 // shuffling keeps resetting this timer, so a snapshot never captures it.
 const SAVE_DELAY_MS = 1000;
@@ -14,14 +16,18 @@ const RESTORE_DELAY_MS = 1500;
 // Wayland clients resize asynchronously; a second pass fixes up windows
 // that ignored or raced the first one.
 const SECOND_PASS_DELAY_MS = 600;
-// No snapshots for this long after a restore: plugging in a dock often
-// produces a second monitors-changed a few seconds after the first, and a
-// snapshot in between would overwrite the good layout with the intermediate
-// config.
-const GRACE_MS = 5000;
-// Two monitors with the laptop as primary is Mutter's transient config on
-// hotplug. If it persists this long, accept it as a real docked setup.
-const TRANSITIONAL_FALLBACK_MS = 8000;
+// No snapshots for at least this long after a restore: plugging in a dock
+// often produces further monitors-changed a few seconds after the first, and
+// a snapshot in between would overwrite the good layout with the
+// intermediate config. Grows with the measured settle time (see _settleMs).
+const MIN_SETTLE_MS = 5000;
+const MAX_AUTO_SETTLE_MS = 20000;
+const SETTLE_MARGIN_MS = 2000;
+const SETTLE_SAMPLES = 5;
+// Same monitors but a different primary than when the setup was saved is
+// usually a dock's intermediate config. If it persists this long, accept it
+// as the user's choice.
+const PRIMARY_MISMATCH_FALLBACK_MS = 8000;
 
 // A closed window stays in the saved state this long. At logout apps close
 // one by one before the shell exits; without this the state file would end
@@ -36,8 +42,10 @@ const TITLE_WATCH_MS = 8000;
 // When a matched window is placed; later passes catch slow clients.
 const MATCH_PASSES_MS = [0, 1000, 4000];
 const LAUNCH_STAGGER_MS = 500;
+// Let the session settle before showing compatibility warnings.
+const COMPAT_NOTIFY_DELAY_MS = 5000;
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 const STATE_FILE = GLib.build_filenamev([GLib.get_user_state_dir(), 'dynamic-window-position', 'session.json']);
 
 let debugEnabled = false;
@@ -49,6 +57,28 @@ function debug(msg) {
 
 function shellPid() {
     return Gio.Credentials.new().get_unix_pid();
+}
+
+// Stable identity of a physical monitor: the same monitor gets the same id
+// whatever connector, position or index it has.
+function monitorId(monitor) {
+    if (monitor.is_builtin())
+        return 'builtin';
+    const serial = monitor.get_serial();
+    const unique = serial && !/^(0x)?0*$/i.test(serial) ? serial : monitor.get_connector();
+    return [monitor.get_vendor(), monitor.get_product(), unique].join(':');
+}
+
+// Moves and shrinks rect so it lies entirely within area.
+function fitInto(area, rect) {
+    const width = Math.min(rect.width, area.width);
+    const height = Math.min(rect.height, area.height);
+    return {
+        x: Math.min(Math.max(rect.x, area.x), area.x + area.width - width),
+        y: Math.min(Math.max(rect.y, area.y), area.y + area.height - height),
+        width,
+        height,
+    };
 }
 
 // Jaccard similarity of the words in two titles, 0..1.
@@ -75,7 +105,9 @@ export default class DynamicWindowPositionExtension extends Extension {
             },
             this);
 
-        this._layouts = new Map(); // setup key -> { activeWorkspace, windows: Map<uid, entry> }
+        // Setups are keyed by the set of connected monitors (see
+        // _monitorInfo); window positions are relative to their monitor.
+        this._layouts = new Map(); // setup key -> { primary, activeWorkspace, windows: Map<uid, entry> }
         this._identities = new Map(); // uid -> { app, wmClass, title, seq }
         this._uids = new Map(); // stable sequence -> uid
         this._fromSession = new Set(); // uids loaded from the state file
@@ -88,8 +120,9 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._timeouts = new Set();
         this._placementUntil = 0;
         this._restoring = false;
+        this._burstStart = this._burstEnd = 0;
         this._saveId = this._restoreId = this._secondPassId = this._graceId = 0;
-        this._currentKey = this._setupKey() ?? 'docked';
+        this._currentKey = this._monitorInfo().key;
 
         global.display.connectObject(
             'window-created', (_display, win) => this._onWindowCreated(win),
@@ -109,6 +142,7 @@ export default class DynamicWindowPositionExtension extends Extension {
             this._endPlacementWindow();
 
         this._save();
+        this._timeout(COMPAT_NOTIFY_DELAY_MS, () => this._notifyCompatibility());
         debug(`enabled, setup=${this._currentKey}, fresh login=${freshLogin}`);
     }
 
@@ -161,22 +195,32 @@ export default class DynamicWindowPositionExtension extends Extension {
         return id;
     }
 
-    // 'laptop', 'external' (lid closed), 'docked', or null while Mutter is
-    // in its transient hotplug config (two monitors, laptop primary).
-    _setupKey() {
-        const monitors = global.backend.get_monitor_manager().get_monitors()
-            .filter(m => m.is_active());
-        if (monitors.length <= 1)
-            return monitors[0]?.is_builtin() === false ? 'external' : 'laptop';
-        const primary = monitors.find(m => m.is_primary());
-        return primary && !primary.is_builtin() ? 'docked' : null;
+    // key: the connected monitors, e.g. "SAM:U32J59x:H4ZMC00130 + builtin";
+    // primary: id of the primary monitor; ids: monitor index -> id.
+    _monitorInfo() {
+        const ids = new Map();
+        const all = [];
+        for (const logical of global.backend.get_monitor_manager().get_logical_monitors()) {
+            const monitors = logical.get_monitors();
+            ids.set(logical.get_number(), monitorId(monitors[0]));
+            for (const monitor of monitors)
+                all.push(monitorId(monitor));
+        }
+        all.sort();
+        return {
+            key: all.join(' + '),
+            primary: ids.get(global.display.get_primary_monitor()) ?? null,
+            ids,
+            laptopOnly: all.length === 1 && all[0] === 'builtin',
+        };
     }
 
-    _describeMonitors() {
-        return global.backend.get_monitor_manager().get_monitors()
-            .filter(m => m.is_active())
-            .map(m => `${m.get_connector()}${m.is_primary() ? '*' : ''}`)
-            .join(',');
+    _monitorIndex(info, id) {
+        for (const [index, monitor] of info.ids) {
+            if (monitor === id)
+                return index;
+        }
+        return undefined;
     }
 
     _isManageable(win) {
@@ -250,8 +294,8 @@ export default class DynamicWindowPositionExtension extends Extension {
                 return;
         }
 
-        // New windows opened on the laptop screen start maximized.
-        if (this._currentKey === 'laptop' && !this._restoring &&
+        if (this._settings.get_string('new-window-placement') === 'maximize-laptop' &&
+            this._monitorInfo().laptopOnly && !this._restoring &&
             win.can_maximize() && !win.is_maximized()) {
             debug(`maximizing new window "${win.get_title()}"`);
             win.maximize();
@@ -301,21 +345,26 @@ export default class DynamicWindowPositionExtension extends Extension {
             return;
         // The monitors changed but the restore hasn't run yet: whatever is
         // on screen now is Mutter's shuffle, not a layout worth keeping.
-        // (null only persists here when the fallback accepted it as docked.)
-        if ((this._setupKey() ?? 'docked') !== this._currentKey)
+        const info = this._monitorInfo();
+        if (info.key !== this._currentKey)
             return;
 
         const previous = this._layouts.get(this._currentKey)?.windows;
         const windows = new Map();
         for (const win of this._windows()) {
             const uid = this._uidFor(win);
+            const index = win.get_monitor();
+            const monitor = global.display.get_monitor_geometry(index);
             const rect = win.get_frame_rect();
             windows.set(uid, {
+                monitor: info.ids.get(index) ?? null,
+                x: rect.x - monitor.x,
+                y: rect.y - monitor.y,
+                width: rect.width,
+                height: rect.height,
+                maximized: win.is_maximized(),
                 workspace: win.get_workspace()?.index() ?? -1,
                 onAllWorkspaces: win.is_on_all_workspaces(),
-                monitor: win.get_monitor(),
-                rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
-                maximized: win.is_maximized(),
             });
             this._identities.set(uid, {
                 app: this._appId(win),
@@ -332,6 +381,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         }
 
         this._layouts.set(this._currentKey, {
+            primary: info.primary,
             activeWorkspace: global.workspace_manager.get_active_workspace_index(),
             windows,
         });
@@ -344,6 +394,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         const layouts = {};
         for (const [key, layout] of this._layouts) {
             layouts[key] = {
+                primary: layout.primary,
                 activeWorkspace: layout.activeWorkspace,
                 windows: Object.fromEntries(layout.windows),
             };
@@ -373,11 +424,14 @@ export default class DynamicWindowPositionExtension extends Extension {
         } catch {
             return false;
         }
+        if (state?.version === 1)
+            state = this._migrateV1(state);
         if (state?.version !== STATE_VERSION)
             return false;
 
         for (const [key, layout] of Object.entries(state.layouts ?? {})) {
             this._layouts.set(key, {
+                primary: layout.primary ?? null,
                 activeWorkspace: layout.activeWorkspace ?? 0,
                 windows: new Map(Object.entries(layout.windows ?? {})),
             });
@@ -403,6 +457,46 @@ export default class DynamicWindowPositionExtension extends Extension {
         for (const uid of this._identities.keys())
             this._pending.add(uid);
         return this._pending.size > 0;
+    }
+
+    // Version 1 kept one 'laptop' and one 'docked' layout with absolute
+    // coordinates and monitor indices. The laptop screen alone is always at
+    // 0,0; the docked layout can only be converted while docked, using the
+    // current arrangement. Anything else is relearned.
+    _migrateV1(state) {
+        const info = this._monitorInfo();
+        const convert = (old, idOf, originOf, primary) => {
+            const windows = {};
+            for (const [uid, entry] of Object.entries(old.windows ?? {})) {
+                const id = idOf(entry.monitor);
+                if (!id)
+                    continue;
+                const origin = originOf(entry.monitor);
+                windows[uid] = {
+                    monitor: id,
+                    x: entry.rect.x - origin.x,
+                    y: entry.rect.y - origin.y,
+                    width: entry.rect.width,
+                    height: entry.rect.height,
+                    maximized: entry.maximized,
+                    workspace: entry.workspace,
+                    onAllWorkspaces: entry.onAllWorkspaces,
+                };
+            }
+            return {primary, activeWorkspace: old.activeWorkspace ?? 0, windows};
+        };
+
+        const layouts = {};
+        if (state.layouts?.laptop)
+            layouts['builtin'] = convert(state.layouts.laptop, () => 'builtin', () => ({x: 0, y: 0}), 'builtin');
+        if (state.layouts?.docked && info.ids.size > 1 && info.primary !== 'builtin') {
+            layouts[info.key] = convert(state.layouts.docked,
+                index => info.ids.get(index),
+                index => global.display.get_monitor_geometry(index),
+                info.primary);
+        }
+        debug(`migrated saved layouts to per-monitor setups: ${Object.keys(layouts).join(', ')}`);
+        return {...state, version: STATE_VERSION, layouts};
     }
 
     // Session restore at login
@@ -528,22 +622,18 @@ export default class DynamicWindowPositionExtension extends Extension {
                 this._uids.get(win.get_stable_sequence()) !== uid)
                 return;
 
+            const info = this._monitorInfo();
             const entry = this._layouts.get(this._currentKey)?.windows.get(uid);
-            if (entry) {
-                this._applyEntry(win, entry);
+            if (entry && this._applyEntry(win, entry, info))
                 return;
-            }
-            // Only saved in the other setup: place by rule on its workspace.
+            // Only saved in another setup: keep its workspace from there.
             let workspace = global.workspace_manager.get_active_workspace_index();
             for (const layout of this._layouts.values()) {
                 const other = layout.windows.get(uid);
                 if (other && !other.onAllWorkspaces && other.workspace >= 0)
                     workspace = other.workspace;
             }
-            if (this._currentKey === 'laptop')
-                this._placeLaptop(win, workspace);
-            else
-                this._placeDocked(win, workspace);
+            this._placeNew(win, workspace, info);
         };
 
         for (const ms of MATCH_PASSES_MS) {
@@ -557,13 +647,40 @@ export default class DynamicWindowPositionExtension extends Extension {
     // Monitor hotplug
 
     _onMonitorsChanged() {
-        debug(`monitors changed: ${this._describeMonitors()} (setup=${this._setupKey()})`);
-        // Restarts the whole restore cycle, including an unfinished grace
+        const info = this._monitorInfo();
+        debug(`monitors changed: ${info.key} (primary ${info.primary})`);
+
+        const now = GLib.get_monotonic_time() / 1000;
+        if (!this._burstStart)
+            this._burstStart = now;
+        this._burstEnd = now;
+
+        // Restarts the whole restore cycle, including an unfinished settle
         // period: nothing has been saved since the last settled setup, so
         // its layouts are still intact.
         this._restoring = true;
         this._cancelTimers();
         this._scheduleRestore(RESTORE_DELAY_MS, false);
+    }
+
+    // How long to keep snapshots off after a restore: the configured value,
+    // or the longest recently measured monitor change plus a margin.
+    _settleMs() {
+        const configured = this._settings.get_int('settle-delay');
+        if (configured > 0)
+            return configured * 1000;
+        const recent = this._settings.get_value('recent-settle-ms').deepUnpack();
+        const longest = recent.length ? Math.max(...recent) : 0;
+        return Math.min(Math.max(longest + SETTLE_MARGIN_MS, MIN_SETTLE_MS), MAX_AUTO_SETTLE_MS);
+    }
+
+    _recordSettle() {
+        const duration = Math.round(this._burstEnd - this._burstStart);
+        this._burstStart = this._burstEnd = 0;
+        const recent = [...this._settings.get_value('recent-settle-ms').deepUnpack(), duration]
+            .slice(-SETTLE_SAMPLES);
+        this._settings.set_value('recent-settle-ms', new GLib.Variant('ai', recent));
+        debug(`monitor change took ${duration} ms to settle; recent: ${recent.join(', ')}`);
     }
 
     _scheduleRestore(delay, isFallback) {
@@ -575,33 +692,34 @@ export default class DynamicWindowPositionExtension extends Extension {
     }
 
     _restore(isFallback) {
-        let key = this._setupKey();
-        if (key === null) {
-            if (!isFallback) {
-                debug('transient monitor config, waiting');
-                this._scheduleRestore(TRANSITIONAL_FALLBACK_MS, true);
-                return;
-            }
-            debug('transient config persisted, treating as docked');
-            key = 'docked';
+        const info = this._monitorInfo();
+        if (!info.ids.size) {
+            this._scheduleRestore(RESTORE_DELAY_MS, isFallback);
+            return;
+        }
+
+        const layout = this._layouts.get(info.key);
+        if (!isFallback && layout?.primary && info.primary !== layout.primary) {
+            debug(`primary is ${info.primary} but was ${layout.primary} in this setup: waiting`);
+            this._scheduleRestore(Math.max(PRIMARY_MISMATCH_FALLBACK_MS, this._settleMs()), true);
+            return;
         }
 
         const fromKey = this._currentKey;
-        debug(`restoring ${fromKey} -> ${key}`);
-
-        const layout = this._layouts.get(key);
+        const key = info.key;
         const prevLayout = fromKey !== key ? this._layouts.get(fromKey) : null;
+        debug(`restoring ${fromKey} -> ${key}${layout ? '' : ' (new setup)'}`);
 
-        this._applyLayout(layout, prevLayout, key);
+        this._applyLayout(layout, prevLayout);
         this._secondPassId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SECOND_PASS_DELAY_MS, () => {
             this._secondPassId = 0;
-            this._applyLayout(layout, prevLayout, key);
-            this._graceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, GRACE_MS, () => {
+            this._applyLayout(layout, prevLayout);
+            this._graceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._settleMs(), () => {
                 this._graceId = 0;
                 // Final fix-up for slow clients whose earlier configure was
                 // acked late and landed them on the active workspace.
                 debug('final pass');
-                this._applyLayout(layout, prevLayout, key);
+                this._applyLayout(layout, prevLayout);
                 this._secondPassId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SECOND_PASS_DELAY_MS, () => {
                     this._secondPassId = 0;
                     this._settle(key);
@@ -615,22 +733,22 @@ export default class DynamicWindowPositionExtension extends Extension {
 
     _settle(key) {
         debug(`settled on ${key}`);
+        this._recordSettle();
         this._currentKey = key;
         this._restoring = false;
         this._save();
     }
 
-    _applyLayout(layout, prevLayout, key) {
+    _applyLayout(layout, prevLayout) {
+        const info = this._monitorInfo();
         for (const win of this._windows()) {
             const uid = this._uids.get(win.get_stable_sequence());
             const entry = uid && layout?.windows.get(uid);
-            if (entry) {
-                this._applyEntry(win, entry);
+            if (entry && this._applyEntry(win, entry, info))
                 continue;
-            }
 
-            // Not seen in this setup before: place it by rule, keeping the
-            // workspace it had in the setup we're coming from.
+            // Not seen in this setup before: keep the workspace it had in
+            // the setup we're coming from.
             const prevEntry = uid && prevLayout?.windows.get(uid);
             let workspace = global.workspace_manager.get_active_workspace_index();
             if (prevEntry && !prevEntry.onAllWorkspaces && prevEntry.workspace >= 0)
@@ -638,34 +756,57 @@ export default class DynamicWindowPositionExtension extends Extension {
             else if (prevLayout)
                 workspace = prevLayout.activeWorkspace;
 
-            if (key === 'laptop')
-                this._placeLaptop(win, workspace);
-            else
-                this._placeDocked(win, workspace);
+            this._placeNew(win, workspace, info);
         }
     }
 
-    _applyEntry(win, entry) {
+    // Returns false if the entry's monitor isn't connected.
+    _applyEntry(win, entry, info) {
+        const index = this._monitorIndex(info, entry.monitor);
+        if (index === undefined)
+            return false;
+
         debug(`restore "${win.get_title()}" ws=${entry.workspace} mon=${entry.monitor} max=${entry.maximized}`);
         if (entry.maximized) {
-            if (entry.monitor < global.display.get_n_monitors() &&
-                win.get_monitor() !== entry.monitor)
-                win.move_to_monitor(entry.monitor);
+            if (win.get_monitor() !== index)
+                win.move_to_monitor(index);
             if (!win.is_maximized())
                 win.maximize();
         } else {
             if (win.is_maximized())
                 win.unmaximize();
-            const {x, y, width, height} = entry.rect;
+            // Positions are relative to the monitor; keep the window fully
+            // visible in case its resolution or scale changed since.
+            const monitor = global.display.get_monitor_geometry(index);
+            const area = global.workspace_manager.get_active_workspace().get_work_area_for_monitor(index);
+            const {x, y, width, height} = fitInto(area, {
+                x: monitor.x + entry.x,
+                y: monitor.y + entry.y,
+                width: entry.width,
+                height: entry.height,
+            });
             win.move_resize_frame(true, x, y, width, height);
         }
 
         if (!entry.onAllWorkspaces && entry.workspace >= 0)
             this._moveToWorkspace(win, entry.workspace);
+        return true;
     }
 
-    _placeDocked(win, workspace) {
-        debug(`place "${win.get_title()}" on external monitor, ws=${workspace}`);
+    // A window with no saved position in the current setup.
+    _placeNew(win, workspace, info) {
+        if (this._settings.get_string('new-window-placement') !== 'maximize-laptop') {
+            debug(`keep "${win.get_title()}" where GNOME put it, ws=${workspace}`);
+            this._moveToWorkspace(win, workspace);
+        } else if (info.laptopOnly) {
+            this._placeLaptop(win, workspace);
+        } else {
+            this._placeExternal(win, workspace);
+        }
+    }
+
+    _placeExternal(win, workspace) {
+        debug(`place "${win.get_title()}" on primary monitor, ws=${workspace}`);
         const primary = global.display.get_primary_monitor();
         const area = global.workspace_manager.get_active_workspace()
             .get_work_area_for_monitor(primary);
@@ -705,5 +846,19 @@ export default class DynamicWindowPositionExtension extends Extension {
             return;
         debug(`  move "${win.get_title()}" ws ${win.is_on_all_workspaces() ? 'all' : current} -> ${index}`);
         win.change_workspace_by_index(index, false);
+    }
+
+    // Warns once per distinct set of issues, not at every login.
+    _notifyCompatibility() {
+        const issues = compatibilityIssues();
+        const ids = issues.map(issue => issue.id).sort().join(',');
+        if (ids === this._settings.get_string('notified-issues'))
+            return;
+        this._settings.set_string('notified-issues', ids);
+        if (!issues.length)
+            return;
+        debug(`compatibility issues: ${ids}`);
+        Main.notify('Dynamic Window Position',
+            `${issues.map(issue => issue.title).join('. ')}. See the extension settings for details.`);
     }
 }

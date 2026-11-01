@@ -3,6 +3,8 @@ import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import {compatibilityIssues} from './compat.js';
+
 export default class DynamicWindowPositionPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
@@ -10,6 +12,8 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
 
         const page = new Adw.PreferencesPage();
         window.add(page);
+
+        this._addCompatibilityGroup(page, window);
 
         // Session restore
         const sessionGroup = new Adw.PreferencesGroup({
@@ -88,12 +92,41 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
         refreshIgnored();
 
         // Layout
-        const layoutGroup = new Adw.PreferencesGroup({title: 'Monitor Layouts'});
+        const layoutGroup = new Adw.PreferencesGroup({
+            title: 'Monitor Layouts',
+            description: 'Each combination of monitors keeps its own layout. These options apply to windows that have no saved position yet in the current setup.',
+        });
         page.add(layoutGroup);
-        layoutGroup.add(this._intSpinRow(settings, 'docked-size-percent', 20, 100, {
-            title: 'Size of new windows on the external monitor',
-            subtitle: 'Percent of the screen, for windows not placed there before',
-        }));
+
+        const placements = ['gnome', 'maximize-laptop'];
+        const placementRow = new Adw.ComboRow({
+            title: 'Windows without a saved position',
+            model: Gtk.StringList.new([
+                'Let GNOME place them',
+                'Maximize on laptop, center on external monitor',
+            ]),
+        });
+        const syncPlacement = () => {
+            placementRow.selected = Math.max(0, placements.indexOf(settings.get_string('new-window-placement')));
+        };
+        syncPlacement();
+        settings.connect('changed::new-window-placement', syncPlacement);
+        placementRow.connect('notify::selected', () =>
+            settings.set_string('new-window-placement', placements[placementRow.selected]));
+        layoutGroup.add(placementRow);
+
+        const sizeRow = this._intSpinRow(settings, 'docked-size-percent', 20, 100, {
+            title: 'Size on the external monitor',
+            subtitle: 'Percent of the screen',
+        });
+        const syncSize = () => {
+            sizeRow.sensitive = settings.get_string('new-window-placement') === 'maximize-laptop';
+        };
+        syncSize();
+        settings.connect('changed::new-window-placement', syncSize);
+        layoutGroup.add(sizeRow);
+
+        this._addSettleRows(layoutGroup, settings);
 
         // Debugging
         const debugGroup = new Adw.PreferencesGroup({title: 'Troubleshooting'});
@@ -104,6 +137,89 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
         });
         settings.bind('debug-logging', debugRow, 'active', Gio.SettingsBindFlags.DEFAULT);
         debugGroup.add(debugRow);
+    }
+
+    // Shown only while there are issues; refreshes when they change.
+    _addCompatibilityGroup(page, window) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Compatibility',
+            description: 'These can stop windows from returning to their place.',
+        });
+        page.add(group);
+
+        const rows = [];
+        const refresh = () => {
+            for (const row of rows.splice(0))
+                group.remove(row);
+
+            const issues = compatibilityIssues();
+            group.visible = issues.length > 0;
+            for (const issue of issues) {
+                const row = new Adw.ActionRow({title: issue.title, subtitle: issue.description});
+                row.add_prefix(new Gtk.Image({icon_name: 'dialog-warning-symbolic'}));
+                if (issue.fix) {
+                    const button = new Gtk.Button({label: issue.fixLabel, valign: Gtk.Align.CENTER});
+                    button.connect('clicked', () => issue.fix());
+                    row.add_suffix(button);
+                }
+                rows.push(row);
+                group.add(row);
+            }
+        };
+
+        // Kept on the window so the change signals stay connected.
+        window._compatSettings = [
+            new Gio.Settings({schema_id: 'org.gnome.mutter'}),
+            new Gio.Settings({schema_id: 'org.gnome.shell'}),
+        ];
+        for (const watched of window._compatSettings)
+            watched.connect('changed', refresh);
+        refresh();
+    }
+
+    _addSettleRows(group, settings) {
+        const measuredMs = () => {
+            const recent = settings.get_value('recent-settle-ms').deepUnpack();
+            return recent.length ? Math.max(...recent) : null;
+        };
+
+        const autoRow = new Adw.SwitchRow({title: 'Measure monitor settle time automatically'});
+        const waitRow = Adw.SpinRow.new_with_range(1, 30, 1);
+        waitRow.set({
+            title: 'Wait for monitors to settle',
+            subtitle: 'Seconds. Increase if windows end up misplaced after connecting a dock.',
+        });
+
+        const sync = () => {
+            const configured = settings.get_int('settle-delay');
+            const measured = measuredMs();
+            autoRow.active = configured === 0;
+            autoRow.subtitle = measured === null
+                ? 'Not measured yet: connect or disconnect a monitor'
+                : `Your monitors took up to ${(measured / 1000).toFixed(1)} s to settle`;
+            waitRow.sensitive = configured !== 0;
+            if (configured !== 0)
+                waitRow.value = configured;
+        };
+        sync();
+        settings.connect('changed::settle-delay', sync);
+        settings.connect('changed::recent-settle-ms', sync);
+
+        autoRow.connect('notify::active', () => {
+            if (autoRow.active === (settings.get_int('settle-delay') === 0))
+                return;
+            // Switching to manual starts from what was measured, plus margin.
+            const measured = measuredMs() ?? 0;
+            settings.set_int('settle-delay',
+                autoRow.active ? 0 : Math.min(30, Math.max(5, Math.ceil(measured / 1000) + 2)));
+        });
+        waitRow.connect('notify::value', () => {
+            if (settings.get_int('settle-delay') !== 0)
+                settings.set_int('settle-delay', waitRow.value);
+        });
+
+        group.add(autoRow);
+        group.add(waitRow);
     }
 
     _intSpinRow(settings, key, min, max, props) {

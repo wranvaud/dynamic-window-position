@@ -3,10 +3,11 @@
 A GNOME Shell extension that keeps your windows where you put them — across
 connecting and disconnecting an external monitor, and across reboots.
 
-- **Per-setup layouts.** It remembers one window layout while docked (external
-  monitor connected) and another for the laptop screen alone, and switches
-  between them automatically when the monitor is plugged in or out: each window
-  goes back to its workspace, monitor, position, size and maximized state.
+- **Per-setup layouts.** It remembers a window layout for each combination of
+  monitors — the laptop screen alone, the laptop with your monitor at home, the
+  laptop with the one at the office — and switches between them automatically
+  when monitors are plugged in or out: each window goes back to its workspace,
+  monitor, position, size and maximized state.
 - **Session restore.** At login it reopens the apps from your last session and
   puts their windows back where they were.
 
@@ -16,10 +17,15 @@ nothing to configure for that.
 ## Requirements
 
 - GNOME Shell 50 (tested on Ubuntu 26.04, Wayland).
-- Fixed workspaces are strongly recommended (Settings → Multitasking →
-  Workspaces → *Fixed number of workspaces*). With dynamic workspaces, GNOME
-  removes empty workspaces when windows move between screens, which renumbers
-  the rest.
+- Fixed workspaces, on the primary display only (Settings → Multitasking).
+  With dynamic workspaces, GNOME removes empty workspaces when windows move
+  between screens, which renumbers the rest. The settings window warns about
+  this and can change it for you, and also warns about other extensions that
+  move windows.
+
+This is a **beta**: it has been used daily on one laptop with one external
+monitor. Reports from other setups are very welcome — enable *Debug logging*
+and include the log (see [Troubleshooting](#troubleshooting)).
 
 ## Install
 
@@ -43,25 +49,33 @@ To update: `git pull` in that folder, run `glib-compile-schemas` again if
 
 ### Monitor hotplug
 
-The extension identifies the current setup as `docked` (two monitors with the
-external one as primary), `laptop` (built-in screen only) or `external` (lid
-closed, external only), and keeps a snapshot of every window for the current
-setup, taken one second after windows stop moving.
+A setup is the set of connected monitors, each identified by its make, model
+and serial number, so the same monitor is recognized whatever port, dock or
+position it is on. Window positions are stored relative to the monitor the
+window is on, and a restored window is always kept fully on screen, even if
+the monitor's resolution or scaling changed since.
 
-When the monitors change it stops taking snapshots, waits for Mutter to finish
-its own rearranging, and restores the saved layout for the new setup in three
-passes (the last one ~6 s later catches slow apps such as Electron apps, which
-apply moves asynchronously). Docks commonly apply a temporary configuration
-with the laptop as primary before the real one; the extension waits that out
-instead of restoring into it.
+The extension keeps a snapshot of every window for the current setup, taken
+one second after windows stop moving. When the monitors change it stops taking
+snapshots, waits for Mutter to finish its own rearranging, and restores the
+saved layout for the new setup in three passes (the last one catches slow apps
+such as Electron apps, which apply moves asynchronously).
 
-Windows that have never been seen in the new setup are placed by rule:
+Docks often apply several monitor configurations in a row when plugged in —
+for example first with the laptop as primary display, then the real one. The
+extension:
 
-- **To the laptop screen:** maximized, on the workspace they were on.
-- **To the external monitor:** unmaximized, centered at 60 % of the screen
-  (configurable), on the same workspace.
-- **Opened while on the laptop screen only:** maximized on the current
-  workspace.
+- waits when the primary display differs from the one saved for that setup,
+  and accepts it after 8 s if it doesn't change (you changed it on purpose);
+- measures how long each monitor change takes to settle and doesn't save
+  layouts until then, so an intermediate configuration is never saved. The
+  wait can also be set by hand in the settings.
+
+Windows with no saved position in the new setup keep their workspace and are
+left where GNOME puts them. Optionally, they can instead be maximized on the
+laptop screen and centered on an external monitor (60 % of the screen by
+default); new windows opened on the laptop screen alone are then maximized
+too.
 
 ### Session restore
 
@@ -89,10 +103,13 @@ For best results, set your browser to reopen its previous session on startup
 Open them from the Extensions app, or with
 `gnome-extensions prefs dynamic-window-position@wranvaud`:
 
+- Compatibility warnings, with one-click fixes for GNOME settings.
 - Turn session restore on or off.
 - Delay before reopening apps at login.
 - Apps not reopened at login (their windows are still put back if they open).
-- Size of new windows on the external monitor.
+- Placement of windows with no saved position: left to GNOME, or maximized on
+  the laptop and centered on an external monitor (with its size).
+- Monitor settle time: measured automatically, or set by hand.
 - Debug logging.
 
 ## Limitations
@@ -102,6 +119,8 @@ Open them from the Extensions app, or with
 - Dialogs, the desktop icons and other special windows are left alone.
 - Snapped (half-screen) windows come back at the right position and size, but
   not as snapped windows.
+- Two identical monitors without serial numbers can only be told apart by the
+  port they are plugged into.
 - Window contents are up to each app: a terminal comes back, its SSH session
   doesn't.
 
