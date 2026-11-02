@@ -18,6 +18,11 @@
       <summary>Seconds after login before reopening apps</summary>
       <description>Gives autostart apps time to open first, so they aren't launched twice.</description>
     </key>
+    <key name="remember-app-positions" type="b">
+      <default>false</default>
+      <summary>Open apps where they were last closed</summary>
+      <description>When an app has no other window open, its new window gets the position, size and monitor its last closed window had in the current monitor setup, on the current workspace. Also used when monitors change and a window has no saved position in the new setup.</description>
+    </key>
     <key name="settle-delay" type="i">
       <range min="0" max="30"/>
       <default>0</default>

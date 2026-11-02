@@ -116,6 +116,9 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._pending = new Set(); // last-session uids not matched to a window yet
         this._exact = new Set(); // windows matched by exact title; no re-matching
         this._closing = new Map(); // uid -> retention timeout id
+        // Where each app's last closed window was, per setup (see
+        // remember-app-positions): app key -> Map<setup key, entry>.
+        this._appPositions = new Map();
         this._tracked = new Set(); // Meta.Window
         this._pendingShown = new Map(); // Meta.Window -> 'shown' handler id
         this._titleWatches = new Map(); // Meta.Window -> 'notify::title' handler id
@@ -172,6 +175,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._pending = null;
         this._exact = null;
         this._closing = null;
+        this._appPositions = null;
         this._tracked = null;
         this._pendingShown = null;
         this._titleWatches = null;
@@ -243,6 +247,16 @@ export default class DynamicWindowPositionExtension extends Extension {
         return app && !app.is_window_backed() ? app.get_id() : null;
     }
 
+    // Apps without a desktop file are told apart by their WM class.
+    _appKey(win) {
+        return this._appId(win) ?? `wm:${win.get_wm_class()}`;
+    }
+
+    _hasOtherWindow(win) {
+        const key = this._appKey(win);
+        return this._windows().some(other => other !== win && this._appKey(other) === key);
+    }
+
     _uidFor(win) {
         const seq = win.get_stable_sequence();
         let uid = this._uids.get(seq);
@@ -292,7 +306,32 @@ export default class DynamicWindowPositionExtension extends Extension {
 
         if (this._inPlacementWindow()) {
             this._watchTitle(win);
-            this._matchWindow(win, false);
+            if (this._matchWindow(win, false))
+                return;
+        }
+
+        if (this._settings.get_boolean('remember-app-positions') && !this._restoring &&
+            !this._hasOtherWindow(win))
+            this._placeFromApp(win);
+    }
+
+    // Puts an app's first window where its last closed window was in this
+    // setup, but on the current workspace.
+    _placeFromApp(win) {
+        const remembered = this._appPositions.get(this._appKey(win))?.get(this._currentKey);
+        if (!remembered)
+            return;
+        debug(`"${win.get_title()}" opens where its app was last closed`);
+        const entry = {...remembered, workspace: -1};
+        const apply = () => {
+            if (!this._restoring && this._tracked.has(win))
+                this._applyEntry(win, entry, this._monitorInfo());
+        };
+        for (const ms of MATCH_PASSES_MS) {
+            if (ms === 0)
+                apply();
+            else
+                this._timeout(ms, apply);
         }
     }
 
@@ -313,6 +352,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         const uid = this._uids.get(seq);
         this._uids.delete(seq);
         if (uid) {
+            this._rememberAppPosition(win, uid);
             this._closing.set(uid, this._timeout(CLOSE_RETENTION_MS, () => {
                 this._closing.delete(uid);
                 this._forget(uid);
@@ -320,6 +360,21 @@ export default class DynamicWindowPositionExtension extends Extension {
             }));
         }
         this._queueSave();
+    }
+
+    _rememberAppPosition(win, uid) {
+        const key = this._appKey(win);
+        let positions = this._appPositions.get(key);
+        for (const [setup, layout] of this._layouts) {
+            const entry = layout.windows.get(uid);
+            if (!entry)
+                continue;
+            if (!positions) {
+                positions = new Map();
+                this._appPositions.set(key, positions);
+            }
+            positions.set(setup, entry);
+        }
     }
 
     _queueSave() {
@@ -399,6 +454,8 @@ export default class DynamicWindowPositionExtension extends Extension {
             savedAt: new Date().toISOString(),
             layouts,
             identities: Object.fromEntries(this._identities),
+            appPositions: Object.fromEntries([...this._appPositions]
+                .map(([app, positions]) => [app, Object.fromEntries(positions)])),
         };
         try {
             GLib.mkdir_with_parents(GLib.path_get_dirname(STATE_FILE), 0o700);
@@ -430,6 +487,8 @@ export default class DynamicWindowPositionExtension extends Extension {
                 windows: new Map(Object.entries(layout.windows ?? {})),
             });
         }
+        for (const [app, positions] of Object.entries(state.appPositions ?? {}))
+            this._appPositions.set(app, new Map(Object.entries(positions)));
         for (const [uid, identity] of Object.entries(state.identities ?? {})) {
             this._identities.set(uid, identity);
             this._fromSession.add(uid);
@@ -742,14 +801,21 @@ export default class DynamicWindowPositionExtension extends Extension {
             if (entry && this._applyEntry(win, entry, info))
                 continue;
 
-            // Not seen in this setup before: place it by rule, keeping the
-            // workspace it had in the setup we're coming from.
+            // Not seen in this setup before: keep the workspace it had in the
+            // setup we're coming from, and use the app's last position here
+            // or else the rule.
             const prevEntry = uid && prevLayout?.windows.get(uid);
             let workspace = global.workspace_manager.get_active_workspace_index();
             if (prevEntry && !prevEntry.onAllWorkspaces && prevEntry.workspace >= 0)
                 workspace = prevEntry.workspace;
             else if (prevLayout)
                 workspace = prevLayout.activeWorkspace;
+
+            const remembered = this._settings.get_boolean('remember-app-positions') &&
+                !this._hasOtherWindow(win) &&
+                this._appPositions.get(this._appKey(win))?.get(info.key);
+            if (remembered && this._applyEntry(win, {...remembered, workspace}, info))
+                continue;
 
             if (info.laptopOnly)
                 this._placeLaptop(win, workspace);

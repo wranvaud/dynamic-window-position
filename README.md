@@ -75,7 +75,18 @@ Windows with no saved position in the new setup keep their workspace and are
 placed by rule: maximized when moving to the laptop screen alone, centered on
 the primary monitor at 60 % of the screen when external
 monitors are connected. This only happens when monitors are connected or
-disconnected; windows you open are always placed by GNOME as usual.
+disconnected; windows you open are placed by GNOME as usual.
+
+### Opening apps where they were last closed (optional, off by default)
+
+GNOME doesn't remember where an app's window was: on Wayland it places every
+new window itself (centered, or in a free spot). With *Open apps where they
+were last closed* on, the extension remembers, for each app and monitor setup,
+where its last window was when it closed. When the app opens again with no
+other window open, the new window gets that position, size and monitor, on
+the workspace you're on. A second window of the same app is left to GNOME. The
+remembered position is also used when monitors change and a window has no
+saved position in the new setup.
 
 ### Session restore
 
@@ -107,6 +118,7 @@ Open them from the Extensions app, or with
 - Turn session restore on or off.
 - Delay before reopening apps at login.
 - Apps not reopened at login (their windows are still put back if they open).
+- Open apps where they were last closed.
 - Monitor settle time: measured automatically, or set by hand.
 - Debug logging.
 

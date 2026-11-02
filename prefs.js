@@ -98,6 +98,13 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
         });
         page.add(layoutGroup);
 
+        const rememberRow = new Adw.SwitchRow({
+            title: 'Open apps where they were last closed',
+            subtitle: 'When an app has no other window open, its new window takes the place of the last one closed in this monitor setup, on the current workspace',
+        });
+        settings.bind('remember-app-positions', rememberRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+        layoutGroup.add(rememberRow);
+
         this._addSettleRows(layoutGroup, settings);
 
         // Debugging
