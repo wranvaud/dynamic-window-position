@@ -51,7 +51,7 @@ To update: `git pull` in that folder, run `glib-compile-schemas` again if
 
 A setup is the set of connected monitors, each identified by its make, model
 and serial number, so the same monitor is recognized whatever port, dock or
-position it is on. Window positions are stored relative to the monitor the
+position it is on, plus which of them is the primary display. Window positions are stored relative to the monitor the
 window is on, and a restored window is always kept fully on screen, even if
 the monitor's resolution or scaling changed since.
 
@@ -65,11 +65,25 @@ Docks often apply several monitor configurations in a row when plugged in —
 for example first with the laptop as primary display, then the real one. The
 extension:
 
-- waits when the primary display differs from the one saved for that setup,
-  and accepts it after 8 s if it doesn't change (you changed it on purpose);
+- waits when the same monitors were saved with a different primary display.
+  If the new primary is still there after 8 s, it becomes a setup of its own:
+  it starts from the other primary's layout but is saved separately. That
+  covers both a primary you changed on purpose and a temporary configuration
+  that lasts. For example, GNOME falls back to a default configuration with the
+  laptop as primary when a monitor's link comes back unable to run its usual
+  mode. Working in that configuration never overwrites your normal layout;
 - measures how long each monitor change takes to settle and doesn't save
   layouts until then, so an intermediate configuration is never saved. The
   wait can also be set by hand in the settings.
+
+With workspaces on the primary display only, a window on a secondary monitor
+is on every workspace. The extension remembers the workspace it last had on
+the primary display, so it goes back to that workspace when it returns there.
+
+Before each monitor change the extension keeps a copy of the layout being
+left (the last three per setup). *Restore previous layout* in the settings
+puts the windows of the current setup back as they were in the newest copy;
+pressing it again goes further back.
 
 Windows with no saved position in the new setup keep their workspace and are
 placed by rule: maximized when moving to the laptop screen alone, centered on
@@ -120,6 +134,7 @@ Open them from the Extensions app, or with
 - Apps not reopened at login (their windows are still put back if they open).
 - Open apps where they were last closed.
 - Monitor settle time: measured automatically, or set by hand.
+- Restore previous layout, for when windows ended up wrong after a monitor change.
 - Debug logging.
 
 ## Limitations

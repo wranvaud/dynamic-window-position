@@ -107,6 +107,16 @@ export default class DynamicWindowPositionPreferences extends ExtensionPreferenc
 
         this._addSettleRows(layoutGroup, settings);
 
+        const undoRow = new Adw.ActionRow({
+            title: 'Restore previous layout',
+            subtitle: 'Puts the windows back as they were before the last monitor change, for the monitors connected now. Press again to go further back.',
+        });
+        const undoButton = new Gtk.Button({label: 'Restore', valign: Gtk.Align.CENTER});
+        undoButton.connect('clicked', () =>
+            settings.set_string('restore-previous-request', new Date().toISOString()));
+        undoRow.add_suffix(undoButton);
+        layoutGroup.add(undoRow);
+
         // Debugging
         const debugGroup = new Adw.PreferencesGroup({title: 'Troubleshooting'});
         page.add(debugGroup);

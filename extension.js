@@ -24,10 +24,14 @@ const MIN_SETTLE_MS = 5000;
 const MAX_AUTO_SETTLE_MS = 20000;
 const SETTLE_MARGIN_MS = 2000;
 const SETTLE_SAMPLES = 5;
-// Same monitors but a different primary than when the setup was saved is
-// usually a dock's intermediate config. If it persists this long, accept it
-// as the user's choice.
+// Same monitors but a different primary than any saved setup is usually a
+// dock's intermediate config, or Mutter's fallback when the stored monitor
+// configuration can't be applied. If it persists this long, accept it as a
+// setup of its own: it starts from the other primary's layout but is saved
+// separately, so it never overwrites it.
 const PRIMARY_MISMATCH_FALLBACK_MS = 8000;
+// Earlier versions of each setup's layout kept for "Restore previous layout".
+const MAX_BACKUPS = 3;
 
 // A closed window stays in the saved state this long. At logout apps close
 // one by one before the shell exits; without this the state file would end
@@ -71,6 +75,35 @@ function monitorId(monitor) {
     return [monitor.get_vendor(), monitor.get_product(), unique].join(':');
 }
 
+// A setup is the connected monitors plus, when there are several, which one
+// is primary, e.g. "SAM:U32J59x:H4ZMC00130 + builtin (primary builtin)".
+const PRIMARY_SUFFIX = ' (primary ';
+
+function setupKey(monitors, primary) {
+    return monitors.includes(' + ') ? `${monitors}${PRIMARY_SUFFIX}${primary})` : monitors;
+}
+
+function monitorsOf(key) {
+    const i = key.lastIndexOf(PRIMARY_SUFFIX);
+    return i < 0 ? key : key.slice(0, i);
+}
+
+function layoutToJson(layout) {
+    return {
+        primary: layout.primary,
+        activeWorkspace: layout.activeWorkspace,
+        windows: Object.fromEntries(layout.windows),
+    };
+}
+
+function layoutFromJson(json) {
+    return {
+        primary: json.primary ?? null,
+        activeWorkspace: json.activeWorkspace ?? 0,
+        windows: new Map(Object.entries(json.windows ?? {})),
+    };
+}
+
 // Moves and shrinks rect so it lies entirely within area.
 function fitInto(area, rect) {
     const width = Math.min(rect.width, area.width);
@@ -105,11 +138,17 @@ export default class DynamicWindowPositionExtension extends Extension {
             'changed::debug-logging', () => {
                 debugEnabled = this._settings.get_boolean('debug-logging');
             },
+            'changed::restore-previous-request', () => this._restorePrevious(),
             this);
+        this._mutterSettings = new Gio.Settings({schema_id: 'org.gnome.mutter'});
 
-        // Setups are keyed by the set of connected monitors (see
-        // _monitorInfo); window positions are relative to their monitor.
+        // Setups are keyed by the connected monitors and the primary one
+        // (see setupKey); window positions are relative to their monitor.
         this._layouts = new Map(); // setup key -> { primary, activeWorkspace, windows: Map<uid, entry> }
+        this._backups = new Map(); // setup key -> [{ savedAt, layout }], newest first
+        // Workspace each window last had where it wasn't forced onto all
+        // workspaces by being on a non-primary monitor (see _workspaceOf).
+        this._lastWorkspace = new Map(); // uid -> { workspace, onAllWorkspaces }
         this._identities = new Map(); // uid -> { app, wmClass, title, seq }
         this._uids = new Map(); // stable sequence -> uid
         this._fromSession = new Set(); // uids loaded from the state file
@@ -168,7 +207,10 @@ export default class DynamicWindowPositionExtension extends Extension {
             GLib.Source.remove(id);
 
         this._settings = null;
+        this._mutterSettings = null;
         this._layouts = null;
+        this._backups = null;
+        this._lastWorkspace = null;
         this._identities = null;
         this._uids = null;
         this._fromSession = null;
@@ -201,8 +243,9 @@ export default class DynamicWindowPositionExtension extends Extension {
         return id;
     }
 
-    // key: the connected monitors, e.g. "SAM:U32J59x:H4ZMC00130 + builtin";
-    // primary: id of the primary monitor; ids: monitor index -> id.
+    // key: the setup (see setupKey); monitors: the connected monitors, e.g.
+    // "SAM:U32J59x:H4ZMC00130 + builtin"; primary: id of the primary
+    // monitor; ids: monitor index -> id.
     _monitorInfo() {
         const ids = new Map();
         const all = [];
@@ -213,9 +256,12 @@ export default class DynamicWindowPositionExtension extends Extension {
                 all.push(monitorId(monitor));
         }
         all.sort();
+        const monitors = all.join(' + ');
+        const primary = ids.get(global.display.get_primary_monitor()) ?? null;
         return {
-            key: all.join(' + '),
-            primary: ids.get(global.display.get_primary_monitor()) ?? null,
+            key: setupKey(monitors, primary),
+            monitors,
+            primary,
             ids,
             laptopOnly: all.length === 1 && all[0] === 'builtin',
         };
@@ -272,6 +318,7 @@ export default class DynamicWindowPositionExtension extends Extension {
             layout.windows.delete(uid);
         this._identities.delete(uid);
         this._fromSession.delete(uid);
+        this._lastWorkspace.delete(uid);
     }
 
     _trackWindow(win) {
@@ -398,7 +445,8 @@ export default class DynamicWindowPositionExtension extends Extension {
         if (info.key !== this._currentKey)
             return;
 
-        const previous = this._layouts.get(this._currentKey)?.windows;
+        const current = this._layouts.get(this._currentKey);
+        const previous = current?.windows;
         const windows = new Map();
         for (const win of this._windows()) {
             const uid = this._uidFor(win);
@@ -412,8 +460,7 @@ export default class DynamicWindowPositionExtension extends Extension {
                 width: rect.width,
                 height: rect.height,
                 maximized: win.is_maximized(),
-                workspace: win.get_workspace()?.index() ?? -1,
-                onAllWorkspaces: win.is_on_all_workspaces(),
+                ...this._workspaceOf(win, uid, current),
             });
             this._identities.set(uid, {
                 app: this._appId(win),
@@ -437,22 +484,46 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._persist();
     }
 
+    // With workspaces on the primary display only, a window on another
+    // monitor is on all workspaces whatever workspace it belongs to. Saving
+    // that would lose its workspace, so keep the one it last had on the
+    // primary display: seen live this session, else in a saved layout where
+    // it was on that layout's primary monitor.
+    _workspaceOf(win, uid, current) {
+        const forcedOnAll = win.is_on_all_workspaces() && !win.is_on_primary_monitor() &&
+            this._mutterSettings.get_boolean('workspaces-only-on-primary');
+        if (!forcedOnAll) {
+            const real = {
+                workspace: win.get_workspace()?.index() ?? -1,
+                onAllWorkspaces: win.is_on_all_workspaces(),
+            };
+            this._lastWorkspace.set(uid, real);
+            return real;
+        }
+
+        const live = this._lastWorkspace.get(uid);
+        if (live)
+            return live;
+        for (const layout of [current, ...this._layouts.values()]) {
+            const entry = layout?.windows.get(uid);
+            if (entry && entry.monitor === layout.primary)
+                return {workspace: entry.workspace, onAllWorkspaces: entry.onAllWorkspaces};
+        }
+        return {workspace: -1, onAllWorkspaces: false};
+    }
+
     // Session state on disk
 
     _persist() {
         const layouts = {};
-        for (const [key, layout] of this._layouts) {
-            layouts[key] = {
-                primary: layout.primary,
-                activeWorkspace: layout.activeWorkspace,
-                windows: Object.fromEntries(layout.windows),
-            };
-        }
+        for (const [key, layout] of this._layouts)
+            layouts[key] = layoutToJson(layout);
         const state = {
             version: STATE_VERSION,
             shellPid: shellPid(),
             savedAt: new Date().toISOString(),
             layouts,
+            backups: Object.fromEntries(this._backups),
             identities: Object.fromEntries(this._identities),
             appPositions: Object.fromEntries([...this._appPositions]
                 .map(([app, positions]) => [app, Object.fromEntries(positions)])),
@@ -480,15 +551,21 @@ export default class DynamicWindowPositionExtension extends Extension {
         if (state?.version !== STATE_VERSION)
             return false;
 
+        // Setups used to be keyed by the monitors alone; add the primary
+        // they were saved with.
+        const rekeyed = new Map();
         for (const [key, layout] of Object.entries(state.layouts ?? {})) {
-            this._layouts.set(key, {
-                primary: layout.primary ?? null,
-                activeWorkspace: layout.activeWorkspace ?? 0,
-                windows: new Map(Object.entries(layout.windows ?? {})),
-            });
+            const newKey = monitorsOf(key) === key && layout.primary
+                ? setupKey(key, layout.primary) : key;
+            rekeyed.set(key, newKey);
+            this._layouts.set(newKey, layoutFromJson(layout));
         }
-        for (const [app, positions] of Object.entries(state.appPositions ?? {}))
-            this._appPositions.set(app, new Map(Object.entries(positions)));
+        for (const [key, backups] of Object.entries(state.backups ?? {}))
+            this._backups.set(key, backups);
+        for (const [app, positions] of Object.entries(state.appPositions ?? {})) {
+            this._appPositions.set(app, new Map(Object.entries(positions)
+                .map(([setup, entry]) => [rekeyed.get(setup) ?? setup, entry])));
+        }
         for (const [uid, identity] of Object.entries(state.identities ?? {})) {
             this._identities.set(uid, identity);
             this._fromSession.add(uid);
@@ -702,7 +779,11 @@ export default class DynamicWindowPositionExtension extends Extension {
 
     _onMonitorsChanged() {
         const info = this._monitorInfo();
-        debug(`monitors changed: ${info.key} (primary ${info.primary})`);
+        debug(`monitors changed: ${info.key}`);
+
+        // First change of a burst: keep the layout being left as it is now.
+        if (!this._restoring)
+            this._backup(this._currentKey);
 
         const now = GLib.get_monotonic_time() / 1000;
         if (!this._burstStart)
@@ -752,17 +833,26 @@ export default class DynamicWindowPositionExtension extends Extension {
             return;
         }
 
-        const layout = this._layouts.get(info.key);
-        if (!isFallback && layout?.primary && info.primary !== layout.primary) {
-            debug(`primary is ${info.primary} but was ${layout.primary} in this setup: waiting`);
-            this._scheduleRestore(Math.max(PRIMARY_MISMATCH_FALLBACK_MS, this._settleMs()), true);
-            return;
+        let layout = this._layouts.get(info.key);
+        let note = '';
+        if (!layout) {
+            const siblingKey = [...this._layouts.keys()]
+                .find(key => key !== info.key && monitorsOf(key) === info.monitors);
+            if (siblingKey && !isFallback) {
+                debug(`primary is ${info.primary}, but these monitors were saved with primary ${this._layouts.get(siblingKey).primary}: waiting`);
+                this._scheduleRestore(Math.max(PRIMARY_MISMATCH_FALLBACK_MS, this._settleMs()), true);
+                return;
+            }
+            // Accepted as a setup of its own: start from the other primary's
+            // layout; snapshots go to this setup's key from now on.
+            layout = siblingKey ? this._layouts.get(siblingKey) : null;
+            note = siblingKey ? ` (new setup, starting from ${siblingKey})` : ' (new setup)';
         }
 
         const fromKey = this._currentKey;
         const key = info.key;
         const prevLayout = fromKey !== key ? this._layouts.get(fromKey) : null;
-        debug(`restoring ${fromKey} -> ${key}${layout ? '' : ' (new setup)'}`);
+        debug(`restoring ${fromKey} -> ${key}${note}`);
 
         this._applyLayout(layout, prevLayout);
         this._secondPassId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SECOND_PASS_DELAY_MS, () => {
@@ -793,12 +883,72 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._save();
     }
 
-    _applyLayout(layout, prevLayout) {
+    // Keeps a copy of a setup's layout, so a layout overwritten by mistake
+    // can be brought back from the settings.
+    _backup(key) {
+        const layout = this._layouts.get(key);
+        if (!layout?.windows.size)
+            return;
+        const json = layoutToJson(layout);
+        const backups = this._backups.get(key) ?? [];
+        if (backups.length && JSON.stringify(backups[0].layout) === JSON.stringify(json))
+            return;
+        backups.unshift({savedAt: new Date().toISOString(), layout: json});
+        this._backups.set(key, backups.slice(0, MAX_BACKUPS));
+        this._persist();
+    }
+
+    // Puts the current setup's newest backup in place and moves the current
+    // layout to the end of the list, so pressing again goes further back and
+    // eventually returns to where it started.
+    _restorePrevious() {
+        const key = this._currentKey;
+        const backups = this._backups.get(key);
+        if (this._restoring || !backups?.length) {
+            Main.notify('Dynamic Window Position', this._restoring
+                ? 'Monitors are changing; try again in a few seconds.'
+                : 'No earlier layout is saved for this monitor setup.');
+            return;
+        }
+
+        const {savedAt, layout} = backups.shift();
+        const current = this._layouts.get(key);
+        if (current?.windows.size)
+            backups.push({savedAt: new Date().toISOString(), layout: layoutToJson(current)});
+        const restored = layoutFromJson(layout);
+        this._layouts.set(key, restored);
+        this._persist();
+        debug(`restoring the layout of ${key} saved ${savedAt}`);
+
+        // Same passes as a monitor change, without the settle wait.
+        this._cancelTimers();
+        this._restoring = true;
+        this._applyLayout(restored, null, true);
+        this._secondPassId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SECOND_PASS_DELAY_MS, () => {
+            this._applyLayout(restored, null, true);
+            this._secondPassId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, MIN_SETTLE_MS, () => {
+                this._secondPassId = 0;
+                this._applyLayout(restored, null, true);
+                this._restoring = false;
+                this._save();
+                return GLib.SOURCE_REMOVE;
+            });
+            return GLib.SOURCE_REMOVE;
+        });
+
+        const when = GLib.DateTime.new_from_iso8601(savedAt, null)?.to_local().format('%a %H:%M') ?? savedAt;
+        Main.notify('Dynamic Window Position', `Restored the layout from ${when}.`);
+    }
+
+    // With onlySaved, windows not in the layout are left alone.
+    _applyLayout(layout, prevLayout, onlySaved = false) {
         const info = this._monitorInfo();
         for (const win of this._windows()) {
             const uid = this._uids.get(win.get_stable_sequence());
             const entry = uid && layout?.windows.get(uid);
             if (entry && this._applyEntry(win, entry, info))
+                continue;
+            if (onlySaved)
                 continue;
 
             // Not seen in this setup before: keep the workspace it had in the

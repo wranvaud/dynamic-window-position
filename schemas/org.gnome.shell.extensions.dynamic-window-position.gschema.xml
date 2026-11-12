@@ -39,6 +39,11 @@
       <summary>Compatibility issues already notified</summary>
       <description>Written by the extension so the same compatibility warning isn't shown at every login.</description>
     </key>
+    <key name="restore-previous-request" type="s">
+      <default>''</default>
+      <summary>Request to restore the previous layout</summary>
+      <description>Written by the settings window when "Restore previous layout" is pressed; the extension then restores the newest saved copy of the current setup's layout.</description>
+    </key>
     <key name="debug-logging" type="b">
       <default>false</default>
       <summary>Debug logging</summary>
