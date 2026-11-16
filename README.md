@@ -80,6 +80,16 @@ With workspaces on the primary display only, a window on a secondary monitor
 is on every workspace. The extension remembers the workspace it last had on
 the primary display, so it goes back to that workspace when it returns there.
 
+After a suspend, GNOME reports the monitors as changed while the lock screen
+is still up, so the restore runs there. Some apps (Slack, for example)
+rearrange their windows once the session is visible again. So when a restore
+ran on the lock screen, the extension applies the same layout again 4 s after
+you unlock, and saves nothing in between.
+
+With *Debug logging* on, every window that changes monitor is logged, with
+whether the extension was moving windows at the time, which helps find out who
+moved a window.
+
 Before each monitor change the extension keeps a copy of the layout being
 left (the last three per setup). *Restore previous layout* in the settings
 puts the windows of the current setup back as they were in the newest copy;

@@ -32,6 +32,11 @@ const SETTLE_SAMPLES = 5;
 const PRIMARY_MISMATCH_FALLBACK_MS = 8000;
 // Earlier versions of each setup's layout kept for "Restore previous layout".
 const MAX_BACKUPS = 3;
+// A restore that ran while the screen was locked (typically after resume) is
+// applied again this long after unlocking: some apps rearrange their windows
+// once they become visible again (seen with Slack, 2026-11-13, ~2 s after
+// unlock). Snapshots are held until then so that move isn't saved.
+const UNLOCK_REPASS_MS = 4000;
 
 // A closed window stays in the saved state this long. At logout apps close
 // one by one before the shell exits; without this the state file would end
@@ -165,14 +170,22 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._placementUntil = 0;
         this._restoring = false;
         this._burstStart = this._burstEnd = 0;
-        this._saveId = this._restoreId = this._secondPassId = this._graceId = 0;
+        this._saveId = this._restoreId = this._secondPassId = this._graceId = this._unlockId = 0;
+        this._holdSaves = false; // until the after-unlock pass (see UNLOCK_REPASS_MS)
+        this._restoredWhileLocked = false;
+        this._lastApplied = null; // layout the last restore applied
+        this._windowMonitors = new Map(); // Meta.Window -> monitor id, for logging moves
         this._currentKey = this._monitorInfo().key;
+        this._locked = Main.sessionMode.isLocked;
 
         global.display.connectObject(
             'window-created', (_display, win) => this._onWindowCreated(win),
             this);
         Main.layoutManager.connectObject(
             'monitors-changed', () => this._onMonitorsChanged(),
+            this);
+        Main.sessionMode.connectObject(
+            'updated', () => this._onSessionModeUpdated(),
             this);
 
         const existing = global.get_window_actors().map(actor => actor.meta_window);
@@ -194,6 +207,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._settings.disconnectObject(this);
         global.display.disconnectObject(this);
         Main.layoutManager.disconnectObject(this);
+        Main.sessionMode.disconnectObject(this);
 
         for (const win of this._tracked)
             win.disconnectObject(this);
@@ -222,15 +236,18 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._pendingShown = null;
         this._titleWatches = null;
         this._timeouts = null;
+        this._windowMonitors = null;
+        this._lastApplied = null;
         this._restoring = false;
     }
 
     _cancelTimers() {
-        for (const id of [this._saveId, this._restoreId, this._secondPassId, this._graceId]) {
+        for (const id of [this._saveId, this._restoreId, this._secondPassId, this._graceId, this._unlockId]) {
             if (id)
                 GLib.Source.remove(id);
         }
-        this._saveId = this._restoreId = this._secondPassId = this._graceId = 0;
+        this._saveId = this._restoreId = this._secondPassId = this._graceId = this._unlockId = 0;
+        this._holdSaves = false;
     }
 
     _timeout(ms, callback) {
@@ -330,8 +347,29 @@ export default class DynamicWindowPositionExtension extends Extension {
             'position-changed', () => this._queueSave(),
             'size-changed', () => this._queueSave(),
             'workspace-changed', () => this._queueSave(),
+            'notify::main-monitor', () => this._onWindowMonitorChanged(win),
             'unmanaged', () => this._onUnmanaged(win),
             this);
+        this._windowMonitors.set(win, this._monitorIdOf(win));
+    }
+
+    _monitorIdOf(win) {
+        const index = win.get_monitor();
+        return index < 0 ? null : this._monitorInfo().ids.get(index) ?? null;
+    }
+
+    // Debug only: says which window changed monitor and whether this
+    // extension was moving windows at the time, to tell its moves apart
+    // from GNOME's and the apps' own.
+    _onWindowMonitorChanged(win) {
+        const to = this._monitorIdOf(win);
+        const from = this._windowMonitors.get(win) ?? null;
+        this._windowMonitors.set(win, to);
+        if (!debugEnabled || from === to || !this._isManageable(win))
+            return;
+        const by = this._restoring ? 'during a restore' : 'outside a restore';
+        const lock = Main.sessionMode.isLocked ? ', screen locked' : '';
+        debug(`"${win.get_title()}" changed monitor ${from} -> ${to} (${by}${lock}, maximized=${win.is_maximized()})`);
     }
 
     _onWindowCreated(win) {
@@ -385,6 +423,7 @@ export default class DynamicWindowPositionExtension extends Extension {
     _onUnmanaged(win) {
         win.disconnectObject(this);
         this._tracked.delete(win);
+        this._windowMonitors.delete(win);
         this._exact.delete(win);
 
         for (const handlers of [this._pendingShown, this._titleWatches]) {
@@ -425,7 +464,7 @@ export default class DynamicWindowPositionExtension extends Extension {
     }
 
     _queueSave() {
-        if (this._restoring)
+        if (this._restoring || this._holdSaves)
             return;
         if (this._saveId)
             GLib.Source.remove(this._saveId);
@@ -437,7 +476,7 @@ export default class DynamicWindowPositionExtension extends Extension {
     }
 
     _save() {
-        if (this._restoring)
+        if (this._restoring || this._holdSaves)
             return;
         // The monitors changed but the restore hasn't run yet: whatever is
         // on screen now is Mutter's shuffle, not a layout worth keeping.
@@ -795,7 +834,57 @@ export default class DynamicWindowPositionExtension extends Extension {
         // its layouts are still intact.
         this._restoring = true;
         this._cancelTimers();
+        if (Main.sessionMode.isLocked)
+            this._restoredWhileLocked = true;
         this._scheduleRestore(RESTORE_DELAY_MS, false);
+    }
+
+    // After resume the restore usually runs on the lock screen. Some apps
+    // rearrange their windows once the session is visible again, so apply
+    // the restored layout once more shortly after unlock, and save nothing
+    // in between (see UNLOCK_REPASS_MS).
+    _onSessionModeUpdated() {
+        const wasLocked = this._locked;
+        this._locked = Main.sessionMode.isLocked;
+        if (!wasLocked || this._locked || !this._restoredWhileLocked)
+            return;
+        this._restoredWhileLocked = false;
+        debug(`unlocked after a restore on the lock screen: applying it again in ${UNLOCK_REPASS_MS} ms`);
+        this._holdSaves = true;
+        if (this._saveId) {
+            GLib.Source.remove(this._saveId);
+            this._saveId = 0;
+        }
+        this._scheduleUnlockPass(UNLOCK_REPASS_MS);
+    }
+
+    _scheduleUnlockPass(delay) {
+        this._unlockId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+            this._unlockId = 0;
+            // The restore itself hasn't settled yet: wait for it.
+            if (this._restoring) {
+                this._scheduleUnlockPass(SECOND_PASS_DELAY_MS);
+                return GLib.SOURCE_REMOVE;
+            }
+            const applied = this._lastApplied;
+            if (!applied || applied.key !== this._currentKey) {
+                this._holdSaves = false;
+                this._save();
+                return GLib.SOURCE_REMOVE;
+            }
+            debug('after-unlock pass');
+            this._restoring = true;
+            this._applyLayout(applied.layout, null, true);
+            this._unlockId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SECOND_PASS_DELAY_MS, () => {
+                this._unlockId = 0;
+                this._applyLayout(applied.layout, null, true);
+                this._restoring = false;
+                this._holdSaves = false;
+                this._save();
+                return GLib.SOURCE_REMOVE;
+            });
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     // How long to keep snapshots off after a restore: the configured value,
@@ -853,6 +942,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         const key = info.key;
         const prevLayout = fromKey !== key ? this._layouts.get(fromKey) : null;
         debug(`restoring ${fromKey} -> ${key}${note}`);
+        this._lastApplied = {key, layout};
 
         this._applyLayout(layout, prevLayout);
         this._secondPassId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SECOND_PASS_DELAY_MS, () => {
