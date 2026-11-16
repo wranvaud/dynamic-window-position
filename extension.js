@@ -166,6 +166,9 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._tracked = new Set(); // Meta.Window
         this._pendingShown = new Map(); // Meta.Window -> 'shown' handler id
         this._titleWatches = new Map(); // Meta.Window -> 'notify::title' handler id
+        // Windows the user moved or resized with the mouse or keyboard: later
+        // placement passes leave them alone.
+        this._userPlaced = new Set();
         this._timeouts = new Set();
         this._placementUntil = 0;
         this._restoring = false;
@@ -180,6 +183,7 @@ export default class DynamicWindowPositionExtension extends Extension {
 
         global.display.connectObject(
             'window-created', (_display, win) => this._onWindowCreated(win),
+            'grab-op-begin', (_display, win) => this._onGrabOpBegin(win),
             this);
         Main.layoutManager.connectObject(
             'monitors-changed', () => this._onMonitorsChanged(),
@@ -235,6 +239,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._tracked = null;
         this._pendingShown = null;
         this._titleWatches = null;
+        this._userPlaced = null;
         this._timeouts = null;
         this._windowMonitors = null;
         this._lastApplied = null;
@@ -408,22 +413,41 @@ export default class DynamicWindowPositionExtension extends Extension {
             return;
         debug(`"${win.get_title()}" opens where its app was last closed`);
         const entry = {...remembered, workspace: -1};
-        const apply = () => {
+        this._runPlacementPasses(win, () => {
             if (!this._restoring && this._tracked.has(win))
                 this._applyEntry(win, entry, this._monitorInfo());
-        };
+        });
+    }
+
+    // Runs apply now and again at each of MATCH_PASSES_MS, to catch clients
+    // that move their window after it appears. Stops once the user moves or
+    // resizes the window themselves, so it doesn't snap back.
+    _runPlacementPasses(win, apply) {
         for (const ms of MATCH_PASSES_MS) {
-            if (ms === 0)
+            const pass = () => {
+                if (this._userPlaced.has(win)) {
+                    debug(`"${win.get_title()}" was moved by the user; skipping the ${ms} ms placement pass`);
+                    return;
+                }
                 apply();
+            };
+            if (ms === 0)
+                pass();
             else
-                this._timeout(ms, apply);
+                this._timeout(ms, pass);
         }
+    }
+
+    _onGrabOpBegin(win) {
+        if (win && this._tracked.has(win))
+            this._userPlaced.add(win);
     }
 
     _onUnmanaged(win) {
         win.disconnectObject(this);
         this._tracked.delete(win);
         this._windowMonitors.delete(win);
+        this._userPlaced.delete(win);
         this._exact.delete(win);
 
         for (const handlers of [this._pendingShown, this._titleWatches]) {
@@ -806,12 +830,7 @@ export default class DynamicWindowPositionExtension extends Extension {
             }
         };
 
-        for (const ms of MATCH_PASSES_MS) {
-            if (ms === 0)
-                apply();
-            else
-                this._timeout(ms, apply);
-        }
+        this._runPlacementPasses(win, apply);
     }
 
     // Monitor hotplug

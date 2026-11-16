@@ -112,6 +112,12 @@ the workspace you're on. A second window of the same app is left to GNOME. The
 remembered position is also used when monitors change and a window has no
 saved position in the new setup.
 
+Some apps move their window again right after it appears, so the position is
+applied once more after 1 s and after 4 s. Those later passes are skipped once
+you start moving or resizing the window yourself. The same applies to windows
+placed by session restore. Keyboard tiling (Super+arrows) doesn't count as
+moving the window here, so a tile made within 4 s of opening can still be undone.
+
 ### Session restore
 
 The layouts are saved to `~/.local/state/dynamic-window-position/session.json`
