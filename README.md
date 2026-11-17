@@ -86,9 +86,13 @@ rearrange their windows once the session is visible again. So when a restore
 ran on the lock screen, the extension applies the same layout again 4 s after
 you unlock, and saves nothing in between.
 
-With *Debug logging* on, every window that changes monitor is logged, with
-whether the extension was moving windows at the time, which helps find out who
-moved a window.
+With *Debug logging* on, every window that changes monitor or workspace is
+logged, with whether the extension was moving windows at the time, which helps
+find out who moved a window. Workspace lines also say which workspace was
+active and whether the window had focus: GNOME's "move window to workspace"
+shortcuts (the switch shortcuts plus Shift) take the focused window along.
+Each save that changes a window's saved workspace is logged too
+(`saved "X" ws 0 -> 1`; workspaces are counted from 0 in the log).
 
 Before each monitor change the extension keeps a copy of the layout being
 left (the last three per setup). *Restore previous layout* in the settings

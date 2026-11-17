@@ -66,6 +66,18 @@ function debug(msg) {
         console.log(`[dynamic-window-position] ${msg}`);
 }
 
+// Workspace index as the restore log lines show it ("ws 0" is the first),
+// or "all" for a window on every workspace.
+function workspaceLabel(win) {
+    if (win.is_on_all_workspaces())
+        return 'all';
+    return String(win.get_workspace()?.index() ?? -1);
+}
+
+function savedWorkspaceLabel(entry) {
+    return entry.onAllWorkspaces ? 'all' : String(entry.workspace);
+}
+
 function shellPid() {
     return Gio.Credentials.new().get_unix_pid();
 }
@@ -178,6 +190,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._restoredWhileLocked = false;
         this._lastApplied = null; // layout the last restore applied
         this._windowMonitors = new Map(); // Meta.Window -> monitor id, for logging moves
+        this._windowWorkspaces = new Map(); // Meta.Window -> workspace label, for logging moves
         this._currentKey = this._monitorInfo().key;
         this._locked = Main.sessionMode.isLocked;
 
@@ -242,6 +255,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._userPlaced = null;
         this._timeouts = null;
         this._windowMonitors = null;
+        this._windowWorkspaces = null;
         this._lastApplied = null;
         this._restoring = false;
     }
@@ -351,11 +365,29 @@ export default class DynamicWindowPositionExtension extends Extension {
         win.connectObject(
             'position-changed', () => this._queueSave(),
             'size-changed', () => this._queueSave(),
-            'workspace-changed', () => this._queueSave(),
+            'workspace-changed', () => {
+                this._onWindowWorkspaceChanged(win);
+                this._queueSave();
+            },
             'notify::main-monitor', () => this._onWindowMonitorChanged(win),
             'unmanaged', () => this._onUnmanaged(win),
             this);
         this._windowMonitors.set(win, this._monitorIdOf(win));
+        this._windowWorkspaces.set(win, workspaceLabel(win));
+    }
+
+    // Debug only, like _onWindowMonitorChanged. "focused" hints at the
+    // move-window-to-workspace shortcuts, which take the focused window along.
+    _onWindowWorkspaceChanged(win) {
+        const to = workspaceLabel(win);
+        const from = this._windowWorkspaces.get(win) ?? null;
+        this._windowWorkspaces.set(win, to);
+        if (!debugEnabled || from === to || !this._isManageable(win))
+            return;
+        const by = this._restoring ? 'during a restore' : 'outside a restore';
+        const active = global.workspace_manager.get_active_workspace_index();
+        const focus = win.has_focus() ? ', focused' : '';
+        debug(`"${win.get_title()}" changed workspace ${from} -> ${to} (${by}, active ws ${active}${focus})`);
     }
 
     _monitorIdOf(win) {
@@ -447,6 +479,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         win.disconnectObject(this);
         this._tracked.delete(win);
         this._windowMonitors.delete(win);
+        this._windowWorkspaces.delete(win);
         this._userPlaced.delete(win);
         this._exact.delete(win);
 
@@ -516,7 +549,7 @@ export default class DynamicWindowPositionExtension extends Extension {
             const index = win.get_monitor();
             const monitor = global.display.get_monitor_geometry(index);
             const rect = win.get_frame_rect();
-            windows.set(uid, {
+            const entry = {
                 monitor: info.ids.get(index) ?? null,
                 x: rect.x - monitor.x,
                 y: rect.y - monitor.y,
@@ -524,7 +557,11 @@ export default class DynamicWindowPositionExtension extends Extension {
                 height: rect.height,
                 maximized: win.is_maximized(),
                 ...this._workspaceOf(win, uid, current),
-            });
+            };
+            windows.set(uid, entry);
+            const old = previous?.get(uid);
+            if (old && (old.workspace !== entry.workspace || old.onAllWorkspaces !== entry.onAllWorkspaces))
+                debug(`saved "${win.get_title()}" ws ${savedWorkspaceLabel(old)} -> ${savedWorkspaceLabel(entry)}`);
             this._identities.set(uid, {
                 app: this._appId(win),
                 wmClass: win.get_wm_class(),
