@@ -91,6 +91,9 @@ logged, with whether the extension was moving windows at the time, which helps
 find out who moved a window. Workspace lines also say which workspace was
 active and whether the window had focus: GNOME's "move window to workspace"
 shortcuts (the switch shortcuts plus Shift) take the focused window along.
+Moves the extension makes while placing a window at login or when it opens
+are marked "during placement". A last-session window that finds no match is
+logged with its app id and WM class.
 Each save that changes a window's saved workspace is logged too
 (`saved "X" ws 0 -> 1`; workspaces are counted from 0 in the log).
 

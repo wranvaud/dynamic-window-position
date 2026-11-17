@@ -184,6 +184,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._timeouts = new Set();
         this._placementUntil = 0;
         this._restoring = false;
+        this._applying = false; // inside _applyEntry, for debug lines
         this._burstStart = this._burstEnd = 0;
         this._saveId = this._restoreId = this._secondPassId = this._graceId = this._unlockId = 0;
         this._holdSaves = false; // until the after-unlock pass (see UNLOCK_REPASS_MS)
@@ -324,9 +325,21 @@ export default class DynamicWindowPositionExtension extends Extension {
             .filter(win => this._isManageable(win));
     }
 
+    // GNOME can take a moment to link a new window to its app, for example
+    // a snap started through a wrapper script (Slack, 2026-11-17): until
+    // then it reports a window-backed app. Fall back to the desktop file
+    // whose StartupWMClass or name matches the window's WM class.
     _appId(win) {
         const app = Shell.WindowTracker.get_default().get_window_app(win);
-        return app && !app.is_window_backed() ? app.get_id() : null;
+        if (app && !app.is_window_backed())
+            return app.get_id();
+        const wmClass = win.get_wm_class();
+        if (!wmClass)
+            return null;
+        const appSystem = Shell.AppSystem.get_default();
+        const byClass = appSystem.lookup_startup_wmclass(wmClass) ??
+            appSystem.lookup_desktop_wmclass(wmClass);
+        return byClass?.get_id() ?? null;
     }
 
     // Apps without a desktop file are told apart by their WM class.
@@ -384,7 +397,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._windowWorkspaces.set(win, to);
         if (!debugEnabled || from === to || !this._isManageable(win))
             return;
-        const by = this._restoring ? 'during a restore' : 'outside a restore';
+        const by = this._moveContext();
         const active = global.workspace_manager.get_active_workspace_index();
         const focus = win.has_focus() ? ', focused' : '';
         debug(`"${win.get_title()}" changed workspace ${from} -> ${to} (${by}, active ws ${active}${focus})`);
@@ -404,9 +417,18 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._windowMonitors.set(win, to);
         if (!debugEnabled || from === to || !this._isManageable(win))
             return;
-        const by = this._restoring ? 'during a restore' : 'outside a restore';
+        const by = this._moveContext();
         const lock = Main.sessionMode.isLocked ? ', screen locked' : '';
         debug(`"${win.get_title()}" changed monitor ${from} -> ${to} (${by}${lock}, maximized=${win.is_maximized()})`);
+    }
+
+    // For the debug lines about windows changing monitor or workspace.
+    _moveContext() {
+        if (this._restoring)
+            return 'during a restore';
+        if (this._applying)
+            return 'during placement';
+        return 'outside a restore';
     }
 
     _onWindowCreated(win) {
@@ -430,6 +452,7 @@ export default class DynamicWindowPositionExtension extends Extension {
             this._watchTitle(win);
             if (this._matchWindow(win, false))
                 return;
+            debug(`no last-session match for "${win.get_title()}" (app ${this._appId(win)}, class ${win.get_wm_class()})`);
         }
 
         if (this._settings.get_boolean('remember-app-positions') && !this._restoring &&
@@ -441,8 +464,10 @@ export default class DynamicWindowPositionExtension extends Extension {
     // setup, but on the current workspace.
     _placeFromApp(win) {
         const remembered = this._appPositions.get(this._appKey(win))?.get(this._currentKey);
-        if (!remembered)
+        if (!remembered) {
+            debug(`"${win.get_title()}": no remembered position for ${this._appKey(win)} in this setup`);
             return;
+        }
         debug(`"${win.get_title()}" opens where its app was last closed`);
         const entry = {...remembered, workspace: -1};
         this._runPlacementPasses(win, () => {
@@ -812,7 +837,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         let bestScore = -1;
         for (const uid of this._pending) {
             const identity = this._identities.get(uid);
-            const sameApp = identity?.app ? identity.app === appId : identity?.wmClass === wmClass;
+            const sameApp = identity?.app && appId ? identity.app === appId : identity?.wmClass === wmClass;
             if (!sameApp)
                 continue;
             const score = identity.title === title ? 100 : titleSimilarity(identity.title, title) * 50;
@@ -1122,6 +1147,15 @@ export default class DynamicWindowPositionExtension extends Extension {
 
     // Returns false if the entry's monitor isn't connected.
     _applyEntry(win, entry, info) {
+        this._applying = true;
+        try {
+            return this._applyEntryNow(win, entry, info);
+        } finally {
+            this._applying = false;
+        }
+    }
+
+    _applyEntryNow(win, entry, info) {
         const index = this._monitorIndex(info, entry.monitor);
         if (index === undefined)
             return false;
@@ -1192,7 +1226,13 @@ export default class DynamicWindowPositionExtension extends Extension {
         if (current === index && !win.is_on_all_workspaces())
             return;
         debug(`  move "${win.get_title()}" ws ${win.is_on_all_workspaces() ? 'all' : current} -> ${index}`);
-        win.change_workspace_by_index(index, false);
+        const wasApplying = this._applying;
+        this._applying = true;
+        try {
+            win.change_workspace_by_index(index, false);
+        } finally {
+            this._applying = wasApplying;
+        }
     }
 
     // Warns once per distinct set of issues, not at every login.
