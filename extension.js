@@ -181,6 +181,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         // Windows the user moved or resized with the mouse or keyboard: later
         // placement passes leave them alone.
         this._userPlaced = new Set();
+        this._fullscreenAsked = new Set(); // windows asked to go fullscreen (see _applyFullscreen)
         this._timeouts = new Set();
         this._placementUntil = 0;
         this._restoring = false;
@@ -254,6 +255,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._pendingShown = null;
         this._titleWatches = null;
         this._userPlaced = null;
+        this._fullscreenAsked = null;
         this._timeouts = null;
         this._windowMonitors = null;
         this._windowWorkspaces = null;
@@ -316,7 +318,9 @@ export default class DynamicWindowPositionExtension extends Extension {
         return win.get_window_type() === Meta.WindowType.NORMAL &&
             !win.is_skip_taskbar() &&
             !win.get_transient_for() &&
-            win.allows_move();
+            // GNOME doesn't allow moving a fullscreen window, but we still
+            // track it, save it and put it back (see _applyEntryNow).
+            (win.allows_move() || win.is_fullscreen());
     }
 
     _windows() {
@@ -419,7 +423,7 @@ export default class DynamicWindowPositionExtension extends Extension {
             return;
         const by = this._moveContext();
         const lock = Main.sessionMode.isLocked ? ', screen locked' : '';
-        debug(`"${win.get_title()}" changed monitor ${from} -> ${to} (${by}${lock}, maximized=${win.is_maximized()})`);
+        debug(`"${win.get_title()}" changed monitor ${from} -> ${to} (${by}${lock}, maximized=${win.is_maximized()}${win.is_fullscreen() ? ', fullscreen' : ''})`);
     }
 
     // For the debug lines about windows changing monitor or workspace.
@@ -506,6 +510,7 @@ export default class DynamicWindowPositionExtension extends Extension {
         this._windowMonitors.delete(win);
         this._windowWorkspaces.delete(win);
         this._userPlaced.delete(win);
+        this._fullscreenAsked.delete(win);
         this._exact.delete(win);
 
         for (const handlers of [this._pendingShown, this._titleWatches]) {
@@ -574,6 +579,8 @@ export default class DynamicWindowPositionExtension extends Extension {
             const index = win.get_monitor();
             const monitor = global.display.get_monitor_geometry(index);
             const rect = win.get_frame_rect();
+            const old = previous?.get(uid);
+            const fullscreen = win.is_fullscreen();
             const entry = {
                 monitor: info.ids.get(index) ?? null,
                 x: rect.x - monitor.x,
@@ -581,10 +588,18 @@ export default class DynamicWindowPositionExtension extends Extension {
                 width: rect.width,
                 height: rect.height,
                 maximized: win.is_maximized(),
+                fullscreen,
                 ...this._workspaceOf(win, uid, current),
             };
+            // A fullscreen window's rect is the whole monitor: keep the size
+            // and maximized state it had before, for when it leaves fullscreen.
+            if (fullscreen && old && !old.fullscreen && old.monitor === entry.monitor) {
+                Object.assign(entry, {x: old.x, y: old.y, width: old.width, height: old.height,
+                    maximized: old.maximized});
+            }
             windows.set(uid, entry);
-            const old = previous?.get(uid);
+            if (old && Boolean(old.fullscreen) !== fullscreen)
+                debug(`saved "${win.get_title()}" fullscreen ${Boolean(old.fullscreen)} -> ${fullscreen}`);
             if (old && (old.workspace !== entry.workspace || old.onAllWorkspaces !== entry.onAllWorkspaces))
                 debug(`saved "${win.get_title()}" ws ${savedWorkspaceLabel(old)} -> ${savedWorkspaceLabel(entry)}`);
             this._identities.set(uid, {
@@ -872,13 +887,19 @@ export default class DynamicWindowPositionExtension extends Extension {
     }
 
     _placeMatched(win, uid) {
+        // The entry as it was when placement started: a save between passes
+        // records the half-placed window (for example one that didn't go
+        // fullscreen yet), which later passes must not take as the target.
+        let target = null;
         const apply = () => {
             if (this._restoring || !this._tracked.has(win) ||
                 this._uids.get(win.get_stable_sequence()) !== uid)
                 return;
 
             const info = this._monitorInfo();
-            const entry = this._layouts.get(this._currentKey)?.windows.get(uid);
+            if (target?.key !== this._currentKey)
+                target = {key: this._currentKey, entry: this._layouts.get(this._currentKey)?.windows.get(uid)};
+            const entry = target.entry;
             if (entry && this._applyEntry(win, entry, info))
                 return;
             // Only saved in another setup: there was no monitor change, so
@@ -1160,13 +1181,20 @@ export default class DynamicWindowPositionExtension extends Extension {
         if (index === undefined)
             return false;
 
-        debug(`restore "${win.get_title()}" ws=${entry.workspace} mon=${entry.monitor} max=${entry.maximized}`);
-        if (entry.maximized) {
+        debug(`restore "${win.get_title()}" ws=${entry.workspace} mon=${entry.monitor} max=${entry.maximized}` +
+            `${entry.fullscreen || win.is_fullscreen() ? ` full=${Boolean(entry.fullscreen)}` : ''}`);
+        if (entry.fullscreen) {
+            this._applyFullscreen(win, index);
+        } else if (entry.maximized) {
+            if (win.is_fullscreen())
+                win.unmake_fullscreen();
             if (win.get_monitor() !== index)
                 win.move_to_monitor(index);
             if (!win.is_maximized())
                 win.maximize();
         } else {
+            if (win.is_fullscreen())
+                win.unmake_fullscreen();
             if (win.is_maximized())
                 win.unmaximize();
             // Positions are relative to the monitor; keep the window fully
@@ -1187,9 +1215,38 @@ export default class DynamicWindowPositionExtension extends Extension {
         return true;
     }
 
+    // Puts a window fullscreen on the monitor at index. If the app doesn't
+    // go fullscreen when asked, the next pass maximizes it there instead.
+    _applyFullscreen(win, index) {
+        if (win.is_fullscreen()) {
+            this._fullscreenAsked.delete(win);
+            if (win.get_monitor() !== index) {
+                // Leave fullscreen to move it, then go back.
+                win.unmake_fullscreen();
+                win.move_to_monitor(index);
+                win.make_fullscreen();
+            }
+            return;
+        }
+        if (win.get_monitor() !== index)
+            win.move_to_monitor(index);
+        if (!this._fullscreenAsked.has(win)) {
+            this._fullscreenAsked.add(win);
+            win.make_fullscreen();
+        } else if (win.can_maximize() && !win.is_maximized()) {
+            debug(`"${win.get_title()}" didn't go fullscreen: maximizing it instead`);
+            win.maximize();
+        }
+    }
+
     _placeExternal(win, workspace) {
         debug(`place "${win.get_title()}" on primary monitor, ws=${workspace}`);
         const primary = global.display.get_primary_monitor();
+        if (win.is_fullscreen()) {
+            this._applyFullscreen(win, primary);
+            this._moveToWorkspace(win, workspace);
+            return;
+        }
         const area = global.workspace_manager.get_active_workspace()
             .get_work_area_for_monitor(primary);
 
@@ -1211,6 +1268,8 @@ export default class DynamicWindowPositionExtension extends Extension {
     _placeLaptop(win, workspace) {
         debug(`place "${win.get_title()}" on laptop, ws=${workspace}`);
         this._moveToWorkspace(win, workspace);
+        if (win.is_fullscreen())
+            return;
         if (win.can_maximize() && !win.is_maximized())
             win.maximize();
     }

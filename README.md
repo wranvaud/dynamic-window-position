@@ -108,6 +108,15 @@ the primary monitor at 60 % of the screen when external
 monitors are connected. This only happens when monitors are connected or
 disconnected; windows you open are placed by GNOME as usual.
 
+### Fullscreen windows
+
+Fullscreen windows are tracked like the others. The extension saves that a
+window is fullscreen and on which monitor, and puts it back fullscreen on that
+monitor. If the app doesn't go fullscreen when asked, it is maximized there
+instead. A window saved as not fullscreen that comes back fullscreen on its
+own (Slack restores its own state) is taken out of fullscreen and placed as
+saved.
+
 ### Opening apps where they were last closed (optional, off by default)
 
 GNOME doesn't remember where an app's window was: on Wayland it places every
